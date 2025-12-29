@@ -538,6 +538,143 @@ function ensureTaskSuggestionForRow_(sheet, row) {
   }
 }
 
+/**
+ * Lernt aus Task-for-Me-Korrekturen (z.B. Unsure → No)
+ * Speichert Patterns (Domain, Subject-Keywords) für zukünftige Klassifizierung
+ */
+function learnFromTaskForMeCorrection_(sheet, row, decision) {
+  try {
+    const messageId = (sheet.getRange(row, 13).getValue() || '').toString().trim(); // M
+    const subject = (sheet.getRange(row, 2).getValue() || '').toString().trim(); // B
+    if (!messageId) return;
+
+    const msg = GmailApp.getMessageById(messageId);
+    const from = (msg.getFrom && msg.getFrom()) || '';
+    const domain = ((from.split('@')[1] || '').split('>')[0] || '').toLowerCase().trim();
+    
+    if (!domain) return;
+
+    const ss = sheet.getParent();
+    let sh = ss.getSheetByName('Task Learning');
+    if (!sh) {
+      sh = ss.insertSheet('Task Learning');
+      sh.getRange(1, 1, 1, 5).setValues([['Domain', 'Subject Pattern', 'Decision', 'Count', 'Last Updated']]);
+    }
+
+    // Extrahiere wichtige Keywords aus Subject (z.B. "Paket", "Packstation", "Benachrichtigung")
+    const subjectLower = subject.toLowerCase();
+    const keywords = extractTaskKeywords_(subjectLower);
+
+    // Speichere Domain + Decision
+    if (domain) {
+      bumpTaskLearning_(sh, domain, '', decision);
+    }
+
+    // Speichere Subject-Keywords + Decision
+    keywords.forEach(keyword => {
+      if (keyword.length > 3) { // Nur relevante Keywords
+        bumpTaskLearning_(sh, '', keyword, decision);
+      }
+    });
+
+    Logger.log(`Task Learning: ${decision} für Domain "${domain}" und Keywords "${keywords.join(', ')}"`);
+  } catch (e) {
+    Logger.log('learnFromTaskForMeCorrection_ error: ' + e);
+  }
+}
+
+/**
+ * Extrahiert wichtige Keywords aus einem Subject für Task-Learning
+ */
+function extractTaskKeywords_(subjectLower) {
+  // Entferne häufige Stoppwörter
+  const stopWords = ['der', 'die', 'das', 'ein', 'eine', 'ist', 'sind', 'für', 'mit', 'von', 'zu', 'in', 'an', 'auf', 'bei', 'über', 'unter', 'durch', 'nach', 'vor', 'seit', 'während', 'wegen', 'trotz', 'ohne', 'gegen', 'um', 'bis', 'ab', 'aus', 'bei', 'hinter', 'neben', 'zwischen', 'innerhalb', 'außerhalb', 'während', 'wegen', 'trotz', 'ohne', 'gegen', 'um', 'bis', 'ab', 'aus', 'bei', 'hinter', 'neben', 'zwischen', 'innerhalb', 'außerhalb'];
+  
+  // Extrahiere Wörter (mindestens 4 Zeichen)
+  const words = subjectLower.split(/\s+/).filter(w => w.length >= 4 && !stopWords.includes(w));
+  
+  // Spezielle Patterns für häufige Infomails
+  const patterns = [];
+  if (subjectLower.includes('paket') || subjectLower.includes('packstation')) patterns.push('paket');
+  if (subjectLower.includes('benachrichtigung') || subjectLower.includes('notification')) patterns.push('benachrichtigung');
+  if (subjectLower.includes('werbung') || subjectLower.includes('newsletter') || subjectLower.includes('angebot')) patterns.push('werbung');
+  if (subjectLower.includes('bestätigung') || subjectLower.includes('confirmation')) patterns.push('bestätigung');
+  if (subjectLower.includes('rechnung') || subjectLower.includes('invoice')) patterns.push('rechnung');
+  
+  return [...new Set([...words.slice(0, 3), ...patterns])]; // Max 3 Wörter + Patterns
+}
+
+/**
+ * Erhöht die Häufigkeit eines Task-Learning-Eintrags
+ */
+function bumpTaskLearning_(sheet, domain, keyword, decision) {
+  const vals = sheet.getDataRange().getValues();
+  for (let i = 1; i < vals.length; i++) {
+    const d = (vals[i][0] || '').toString().toLowerCase().trim();
+    const k = (vals[i][1] || '').toString().toLowerCase().trim();
+    const dec = (vals[i][2] || '').toString().trim();
+    if (d === domain.toLowerCase().trim() && k === keyword.toLowerCase().trim() && dec === decision) {
+      const n = Number(vals[i][3] || 0) + 1;
+      sheet.getRange(i + 1, 3).setValue(decision);
+      sheet.getRange(i + 1, 4).setValue(n);
+      sheet.getRange(i + 1, 5).setValue(new Date());
+      return;
+    }
+  }
+  sheet.appendRow([domain.toLowerCase().trim(), keyword.toLowerCase().trim(), decision, 1, new Date()]);
+}
+
+/**
+ * Prüft basierend auf gelernten Patterns, ob eine E-Mail wahrscheinlich "No" (kein Task) ist
+ */
+function shouldBeTaskForMe_(domain, subject) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName('Task Learning');
+    if (!sh || sh.getLastRow() < 2) return null; // Keine Daten → keine Entscheidung
+
+    const vals = sh.getDataRange().getValues();
+    const domainLower = (domain || '').toLowerCase().trim();
+    const subjectLower = (subject || '').toLowerCase();
+    const keywords = extractTaskKeywords_(subjectLower);
+
+    let noCount = 0;
+    let yesCount = 0;
+
+    // Zähle "No" und "Yes" für Domain
+    if (domainLower) {
+      for (let i = 1; i < vals.length; i++) {
+        const d = (vals[i][0] || '').toString().toLowerCase().trim();
+        const dec = (vals[i][2] || '').toString().trim();
+        const count = Number(vals[i][3] || 0);
+        if (d === domainLower && dec === 'No') noCount += count;
+        if (d === domainLower && dec === 'Yes') yesCount += count;
+      }
+    }
+
+    // Zähle "No" und "Yes" für Keywords
+    keywords.forEach(keyword => {
+      for (let i = 1; i < vals.length; i++) {
+        const k = (vals[i][1] || '').toString().toLowerCase().trim();
+        const dec = (vals[i][2] || '').toString().trim();
+        const count = Number(vals[i][3] || 0);
+        if (k === keyword.toLowerCase() && dec === 'No') noCount += count;
+        if (k === keyword.toLowerCase() && dec === 'Yes') yesCount += count;
+      }
+    });
+
+    // Wenn deutlich mehr "No" als "Yes": return "No"
+    if (noCount > yesCount * 2 && noCount >= 2) return 'No';
+    // Wenn deutlich mehr "Yes" als "No": return "Yes"
+    if (yesCount > noCount * 2 && yesCount >= 2) return 'Yes';
+    
+    return null; // Unentschieden
+  } catch (e) {
+    Logger.log('shouldBeTaskForMe_ error: ' + e);
+    return null;
+  }
+}
+
 
 syncGoogleTaskForRow_()
 

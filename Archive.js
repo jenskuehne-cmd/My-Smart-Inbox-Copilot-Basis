@@ -188,11 +188,21 @@ function onSheetEdit_(e) {
       syncGoogleTaskForRow_(sh, row); // Prio-Aenderung kann Auswirkung auf Task haben
     }
 
-    // 5) Task for Me (Spalte I) Logging + KI-Task-Suggestion + Google Tasks Sync
+    // 5) Task for Me (Spalte I) Logging + KI-Task-Suggestion + Google Tasks Sync + Learning
     if (col === 9) { // I = Task for Me
       recordCorrection_(sh, row, col, e.oldValue, e.value);
 
       const newVal = (e.range.getValue() || '').toString().trim();
+      const oldVal = (e.oldValue || '').toString().trim();
+
+      // Learning: Wenn von "Unsure" auf "No" geändert → lerne, dass solche Mails keine Tasks sind
+      if ((oldVal === 'Unsure' || oldVal === '') && newVal === 'No') {
+        learnFromTaskForMeCorrection_(sh, row, 'No');
+      }
+      // Learning: Wenn von "Unsure" auf "Yes" geändert → lerne, dass solche Mails Tasks sind
+      if ((oldVal === 'Unsure' || oldVal === '') && newVal === 'Yes') {
+        learnFromTaskForMeCorrection_(sh, row, 'Yes');
+      }
 
       // Wenn jetzt "Yes": zuerst KI-Suggestion erzeugen (falls E leer)
       if (newVal === 'Yes') {

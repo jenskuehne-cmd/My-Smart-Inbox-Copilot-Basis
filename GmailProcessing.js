@@ -52,6 +52,34 @@ function processEmailsDateRange(startDate, endDate) {
 
 // Kernverarbeitung fuer alle Varianten
 function processThreads_(threads) {
+  // API-Key Validierung am Anfang
+  const apiTest = testGeminiAPIKey();
+  if (!apiTest.valid || apiTest.quotaExceeded) {
+    const ui = SpreadsheetApp.getUi();
+    let title = '⚠️ Gemini API-Key Problem';
+    let message = apiTest.message;
+    
+    if (apiTest.quotaExceeded) {
+      title = '⚠️ API-Limit erreicht';
+      message = `Der Gemini API-Key ist gültig, aber das Free-Tier-Limit wurde erreicht.\n\n${apiTest.message}\n\nMöchten Sie trotzdem fortfahren? (Die E-Mails werden ohne KI-Funktionen verarbeitet.)`;
+    } else {
+      message = `Der Gemini API-Key funktioniert nicht:\n\n${apiTest.message}\n\nMöchten Sie trotzdem fortfahren? (Die E-Mails werden ohne KI-Funktionen verarbeitet.)`;
+    }
+    
+    const response = ui.alert(title, message, ui.ButtonSet.YES_NO);
+    
+    if (response === ui.Button.NO) {
+      Logger.log('Verarbeitung abgebrochen: API-Key-Problem');
+      return;
+    }
+    // Wenn YES: weiter mit Warnung, aber ohne KI-Funktionen
+    if (apiTest.quotaExceeded) {
+      Logger.log('WARNUNG: Verarbeitung ohne KI-Funktionen (API-Limit erreicht)');
+    } else {
+      Logger.log('WARNUNG: Verarbeitung ohne funktionierenden API-Key');
+    }
+  }
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
   if (!sheet) {
@@ -59,9 +87,10 @@ function processThreads_(threads) {
     return;
   }
 
-  // Spalten-Setup (A–M = 1–13)
+  // Spalten-Setup (A–N = 1–14)
   const COL_MESSAGE_ID = 13; // M
-  const COLS_TOTAL = 13;     // bis M
+  const COL_COST = 14;        // N: API-Kosten
+  const COLS_TOTAL = 14;      // bis N
 
   // Bereits vorhandene Message-IDs (Duplikatcheck)
   const existingIds = new Set();
@@ -204,11 +233,13 @@ function processThreads_(threads) {
 
       // --- NEU: KI-Labelvorschlag basierend auf Subject & Body ---
       let aiLabel = '';
-      try {
-        aiLabel = getAILabelSuggestion(subject, body) || '';
-      } catch (e) {
-        Logger.log('AI label suggestion failed: ' + e);
-        aiLabel = '';
+      if (apiTest.valid && !apiTest.quotaExceeded) {
+        try {
+          aiLabel = getAILabelSuggestion(subject, body) || '';
+        } catch (e) {
+          Logger.log('AI label suggestion failed: ' + e);
+          aiLabel = '';
+        }
       }
 
       // Finales Label, das in Spalte A landet (und spaeter nach Gmail geht)
@@ -237,7 +268,29 @@ function processThreads_(threads) {
           || (CONFIG.MY_TEAM_KEYWORDS || [])
       };
 
-      const action = getAIActionabilityAnalysis(subject, body, myProfile); // { is_task_for_me, reasons, ... }
+      let action = { is_task_for_me: 'Unsure', reasons: '', suggested_owner: 'unknown', tasks: [] };
+      if (apiTest.valid && !apiTest.quotaExceeded) {
+        // Prüfe zuerst gelernte Patterns (falls vorhanden)
+        const fromDomain = (fromEmail.split('@')[1] || '').toLowerCase();
+        const learnedDecision = shouldBeTaskForMe_(fromDomain, subject);
+        
+        if (learnedDecision === 'No') {
+          // Gelernt: Diese Art von Mail ist kein Task → überspringe AI-Analyse
+          action = { is_task_for_me: 'No', reasons: 'Basierend auf gelernten Patterns (Infomail)', suggested_owner: 'unknown', tasks: [] };
+          Logger.log(`Task Learning: Überspringe AI-Analyse für "${subject}" (gelernt: No)`);
+        } else {
+          action = getAIActionabilityAnalysis(subject, body, myProfile); // { is_task_for_me, reasons, ... }
+          
+          // Wenn AI "Unsure" sagt, aber gelernte Patterns "Yes" → verwende "Yes"
+          if (action.is_task_for_me === 'Unsure' && learnedDecision === 'Yes') {
+            action.is_task_for_me = 'Yes';
+            action.reasons = (action.reasons || '') + ' (bestätigt durch gelernte Patterns)';
+            Logger.log(`Task Learning: AI sagte "Unsure", aber gelernte Patterns sagen "Yes" → verwende "Yes"`);
+          }
+        }
+      } else {
+        action.reasons = apiTest.quotaExceeded ? 'API-Limit erreicht' : 'API-Key nicht verfügbar';
+      }
 
       const taskForMe = action.is_task_for_me || 'Unsure';
       const notesExtra = action.reasons ? ` | AI-Task: ${action.reasons}` : '';
@@ -273,26 +326,72 @@ function processThreads_(threads) {
       let aiSummary = '';
       let aiReply = '';
       let status = isToday ? (CONFIG.STATUS_DEFAULT || 'New') : (CONFIG.STATUS_DEFAULT_OLD || 'Open');
+      let totalCost = ''; // Kosten für diese E-Mail
 
       if (calendarInvite) {
         aiSummary = 'Kalendereinladung erkannt – bitte im Kalender bestaetigen/ablehnen.';
         status = 'Calendar Invite';
       } else {
-        aiSummary = getAISummarySmart(body);
-        const lastReplyISO = replyInfo.myLastReplyDate ? replyInfo.myLastReplyDate.toISOString() : '';
-        aiReply = getAIResponseSuggestionWithLang(
-          body,
-          !!replyInfo.hasReplied,
-          lastReplyISO,
-          replyLangHint
-        );
+        if (apiTest.valid && !apiTest.quotaExceeded) {
+          // Kosten-Objekt zurücksetzen
+          globalApiCosts = {};
+          
+          aiSummary = getAISummarySmart(body);
+          const lastReplyISO = replyInfo.myLastReplyDate ? replyInfo.myLastReplyDate.toISOString() : '';
+          
+          // Prüfe, ob es eine Infomail ist → dann kein Reply-Vorschlag
+          const isInfoMail = shouldGenerateReply_(subject, body, action);
+          if (isInfoMail) {
+            aiReply = ''; // Kein Reply-Vorschlag für Infomails
+            Logger.log(`Reply-Suggestion übersprungen: Infomail erkannt ("${subject}")`);
+          } else {
+            aiReply = getAIResponseSuggestionWithLang(
+              body,
+              !!replyInfo.hasReplied,
+              lastReplyISO,
+              replyLangHint
+            );
+          }
+          
+          // Kosten sammeln und berechnen
+          const config = getGeminiAPIConfig_();
+          const model = config.model || 'gemini-2.5-pro';
+          let totalUsage = { prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0, total_tokens: 0 };
+          
+          if (globalApiCosts['summary']) {
+            totalUsage.prompt_tokens += globalApiCosts['summary'].prompt_tokens || 0;
+            totalUsage.completion_tokens += globalApiCosts['summary'].completion_tokens || 0;
+            totalUsage.reasoning_tokens += globalApiCosts['summary'].reasoning_tokens || 0;
+            totalUsage.total_tokens += globalApiCosts['summary'].total_tokens || 0;
+          }
+          if (globalApiCosts['reply']) {
+            totalUsage.prompt_tokens += globalApiCosts['reply'].prompt_tokens || 0;
+            totalUsage.completion_tokens += globalApiCosts['reply'].completion_tokens || 0;
+            totalUsage.reasoning_tokens += globalApiCosts['reply'].reasoning_tokens || 0;
+            totalUsage.total_tokens += globalApiCosts['reply'].total_tokens || 0;
+          }
+          if (globalApiCosts['actionability']) {
+            totalUsage.prompt_tokens += globalApiCosts['actionability'].prompt_tokens || 0;
+            totalUsage.completion_tokens += globalApiCosts['actionability'].completion_tokens || 0;
+            totalUsage.reasoning_tokens += globalApiCosts['actionability'].reasoning_tokens || 0;
+            totalUsage.total_tokens += globalApiCosts['actionability'].total_tokens || 0;
+          }
+          
+          if (totalUsage.total_tokens > 0) {
+            totalCost = calculateAPICost_(totalUsage, model);
+          }
+        } else {
+          const reason = apiTest.quotaExceeded ? 'API-Limit erreicht' : 'API-Key-Problem';
+          aiSummary = `Keine AI-Summary verfügbar (${reason})`;
+          aiReply = `Keine AI-Antwortvorschläge verfügbar (${reason})`;
+        }
 
         if (CONFIG.ENABLE_REPLY_TRACKING && replyInfo.hasReplied) {
           status = 'Replied';
         }
       }
 
-      // Zeile (A–M) schreiben
+      // Zeile (A–N) schreiben
       const row = [
         finalLabel,                               // A
         subject || '(no subject)',                // B
@@ -306,7 +405,8 @@ function processThreads_(threads) {
         aiReply,                                  // J
         new Date(),                               // K
         `=HYPERLINK("${emailLink}","Email Link")`,// L
-        messageId                                 // M
+        messageId,                                // M
+        totalCost                                 // N: API-Kosten
       ];
 
 
