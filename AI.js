@@ -1,5 +1,11 @@
 /*** AI.gs ***/
 
+// Globales Objekt zum Speichern von API-Kosten pro Request
+// Wird in GmailProcessing.js initialisiert, aber hier als Fallback definiert
+if (typeof globalApiCosts === 'undefined') {
+  var globalApiCosts = {};
+}
+
 /**
  * Berechnet die geschätzten Kosten basierend auf Token-Usage
  * @param {Object} usage - Usage-Objekt mit prompt_tokens, completion_tokens, etc.
@@ -772,45 +778,125 @@ function getAISummarySmart(emailText) {
     
     var lastErr = null;
     var lastUsage = null;
+    var lastResponse = null;
     for (var attempt = 1; attempt <= 3; attempt++) {
       try {
+        Logger.log(`Summary-Generierung Versuch ${attempt}/3`);
         const res = callGeminiAPI_(payload);
         const code = res.getResponseCode();
         const txt = res.getContentText() || '';
+        lastResponse = { code, text: txt.substring(0, 500) };
+        
+        Logger.log(`Summary API Response: Code ${code}, Text: ${txt.substring(0, 300)}`);
+        
         if (code >= 200 && code < 300) {
           const data = JSON.parse(txt || '{}');
-          const out = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+          
+          // Prüfe verschiedene mögliche Response-Strukturen
+          let out = null;
+          
+          // Gemini-Format: candidates[0].content.parts[0].text
+          if (data.candidates && Array.isArray(data.candidates) && data.candidates.length > 0) {
+            out = data.candidates[0]?.content?.parts?.[0]?.text;
+          }
+          
+          // Portkey/OpenAI-Format: choices[0].message.content (falls nicht konvertiert)
+          if (!out && data.choices && Array.isArray(data.choices) && data.choices.length > 0) {
+            out = data.choices[0]?.message?.content || data.choices[0]?.content || data.choices[0]?.text;
+          }
+          
+          // Fallback: direktes text-Feld
+          if (!out && data.text) {
+            out = data.text;
+          }
+          
           // Kosten speichern
           if (res.getUsage) {
             lastUsage = res.getUsage();
+            Logger.log(`Summary Usage: ${JSON.stringify(lastUsage)}`);
           }
+          
           if (out && out.trim()) {
-            // Speichere Kosten für späteren Zugriff
-            if (lastUsage && !globalApiCosts) globalApiCosts = {};
-            if (lastUsage) globalApiCosts['summary'] = lastUsage;
+            Logger.log(`Summary erfolgreich generiert (${out.length} Zeichen)`);
+            // Speichere Kosten für späteren Zugriff (nur wenn globalApiCosts existiert)
+            try {
+              if (lastUsage && typeof globalApiCosts !== 'undefined') {
+                if (!globalApiCosts) globalApiCosts = {};
+                globalApiCosts['summary'] = lastUsage;
+              }
+            } catch (e) {
+              // globalApiCosts nicht verfügbar - ignorieren (nicht kritisch)
+              Logger.log('Hinweis: globalApiCosts nicht verfügbar (OK für manuelle Generierung)');
+            }
             return out.trim();
+          } else {
+            Logger.log(`WARNUNG: API Response Code ${code}, aber kein Text gefunden`);
+            Logger.log(`Response-Struktur: ${JSON.stringify(data).substring(0, 1000)}`);
+            
+            // Prüfe auf Usage-Informationen (könnte zeigen, dass nur Reasoning-Tokens verwendet wurden)
+            const usage = data.usage || {};
+            const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens || 0;
+            const completionTokens = usage.completion_tokens || 0;
+            
+            if (reasoningTokens > 0 && completionTokens === 0) {
+              lastErr = `Nur Reasoning-Tokens verwendet (${reasoningTokens}), keine Completion-Tokens - max_tokens möglicherweise zu niedrig für gemini-2.5-pro`;
+            } else {
+              lastErr = `HTTP ${code} - Kein Text in Response (Struktur: ${Object.keys(data).join(', ')})`;
+            }
           }
         } else {
-          lastErr = 'HTTP ' + code + ' ' + txt.slice(0, 200);
+          lastErr = `HTTP ${code}: ${txt.slice(0, 200)}`;
+          Logger.log(`Summary API Fehler: ${lastErr}`);
         }
       } catch (e) {
         lastErr = e && e.message ? e.message : '' + e;
+        Logger.log(`Summary API Exception: ${lastErr}`);
       }
-      Utilities.sleep(300 + Math.floor(Math.random() * 300)); // leichter Backoff
+      if (attempt < 3) {
+        Utilities.sleep(300 + Math.floor(Math.random() * 300)); // leichter Backoff
+      }
     }
-    Logger.log('Gemini Summary Error: ' + (lastErr || 'unknown'));
+    Logger.log(`Gemini Summary Error nach ${attempt} Versuchen: ${lastErr || 'unknown'}`);
+    Logger.log(`Letzte Response: ${JSON.stringify(lastResponse)}`);
     // Fallback-Text, falls alle Versuche fehlschlagen:
-    return 'Keine AI-Summary verfügbar (Netzwerk/Limit).';
+    return `Keine AI-Summary verfügbar (Fehler: ${lastErr || 'unbekannt'})`;
   } catch (e) {
     Logger.log('Gemini Summary Fatal: ' + e);
-    return 'Keine AI-Summary verfügbar (Error).';
+    Logger.log('Stack: ' + e.stack);
+    return `Keine AI-Summary verfügbar (Fatal Error: ${e.message || e})`;
   }
 }
 function getAIResponseSuggestionWithLang(emailText, hasReplied, lastReplyISO, replyLangHint) {
   try {
-  const base = hasReplied
-    ? `You already replied on ${lastReplyISO}. Draft a short, polite follow-up if no response has been received since then. Keep it under 80 words.`
-    : `Suggest a concise, professional first reply. Keep it under 100 words.`;
+  // Prüfe, ob es sich um eine Dankes- oder Grußmail handelt
+  const emailLower = emailText.toLowerCase();
+  const isGratitude = [
+    'danke', 'thank you', 'thanks', 'vielen dank', 'herzlichen dank',
+    'dankeschön', 'thank you very much', 'merci', 'grazie'
+  ].some(pattern => emailLower.includes(pattern));
+  
+  const isGreeting = [
+    'frohe weihnachten', 'merry christmas', 'frohes neues jahr', 'happy new year',
+    'frohe ostern', 'happy easter', 'schöne feiertage', 'happy holidays',
+    'grüße', 'greetings', 'liebe grüße', 'best regards', 'kind regards',
+    'viele grüße', 'best wishes', 'herzliche grüße', 'warm regards',
+    'frohe festtage', 'season\'s greetings'
+  ].some(pattern => emailLower.includes(pattern));
+
+  let base;
+  if (isGratitude) {
+    base = hasReplied
+      ? `You already replied on ${lastReplyISO}. Draft a short, polite acknowledgment if appropriate. Keep it under 60 words.`
+      : `This appears to be a thank-you message. Suggest a warm, friendly, and brief reply acknowledging their thanks. Match the tone and formality level. Keep it under 80 words.`;
+  } else if (isGreeting) {
+    base = hasReplied
+      ? `You already replied on ${lastReplyISO}. Draft a short, polite greeting response if appropriate. Keep it under 60 words.`
+      : `This appears to be a greeting message (e.g., holiday greetings, seasonal wishes). Suggest a warm, friendly, and brief reply reciprocating the greeting. Match the tone and formality level. Keep it under 80 words.`;
+  } else {
+    base = hasReplied
+      ? `You already replied on ${lastReplyISO}. Draft a short, polite follow-up if no response has been received since then. Keep it under 80 words.`
+      : `Suggest a concise, professional first reply. Keep it under 100 words.`;
+  }
 
   const langLine = replyLangHint ? `Write the reply in ${replyLangHint}.` : 'Write the reply in the same language as the latest inbound message.';
   const prompt = `${base}\n${langLine}\n\nEmail thread context (latest inbound message):\n${emailText}`;
@@ -838,12 +924,45 @@ function getAIResponseSuggestionWithLang(emailText, hasReplied, lastReplyISO, re
 /**
  * Prüft, ob für diese E-Mail ein Reply-Vorschlag generiert werden sollte
  * Infomails (Paket-Benachrichtigungen, Bestätigungen, Newsletter, Werbung) → kein Reply
+ * ABER: Dankes- und Grußmails → IMMER Reply generieren
+ * 
+ * @param {string} subject - E-Mail Betreff
+ * @param {string} body - E-Mail Body
+ * @param {Object} actionAnalysis - AI-Analyse mit is_task_for_me, etc.
+ * @param {string} fromEmail - Absender-E-Mail (optional, für Domain-Learning)
+ * @return {boolean} true = Reply generieren, false = kein Reply
  */
-function shouldGenerateReply_(subject, body, actionAnalysis) {
+function shouldGenerateReply_(subject, body, actionAnalysis, fromEmail) {
   try {
     const subjectLower = (subject || '').toLowerCase();
     const bodyLower = (body || '').toLowerCase();
     const combined = `${subjectLower} ${bodyLower}`;
+    
+    // WICHTIG: Dankes- und Grußmails IMMER beantworten (auch wenn sie als Infomail gelten)
+    const gratitudePatterns = [
+      'danke', 'thank you', 'thanks', 'vielen dank', 'herzlichen dank',
+      'dankeschön', 'thank you very much', 'merci', 'grazie',
+      'frohe weihnachten', 'merry christmas', 'frohes neues jahr', 'happy new year',
+      'frohe ostern', 'happy easter', 'schöne feiertage', 'happy holidays',
+      'grüße', 'greetings', 'liebe grüße', 'best regards', 'kind regards',
+      'viele grüße', 'best wishes', 'herzliche grüße', 'warm regards',
+      'frohe festtage', 'season\'s greetings', 'frohe weihnacht', 'merry xmas'
+    ];
+    
+    if (gratitudePatterns.some(pattern => combined.includes(pattern))) {
+      Logger.log(`shouldGenerateReply_: Dankes-/Grußmail erkannt → Reply generieren`);
+      return true; // Dankes-/Grußmail → IMMER Reply generieren
+    }
+    
+    // Prüfe gelernte Patterns: Wenn "Task for Me" = "No" gelernt wurde → wahrscheinlich Infomail
+    if (fromEmail) {
+      const fromDomain = (fromEmail.split('@')[1] || '').toLowerCase();
+      const learnedDecision = shouldBeTaskForMe_(fromDomain, subject);
+      if (learnedDecision === 'No') {
+        Logger.log(`shouldGenerateReply_: Gelernt "No" für Domain "${fromDomain}" → kein Reply`);
+        return false; // Gelernt: Kein Task → kein Reply
+      }
+    }
     
     // Wenn AI-Analyse sagt "No" (kein Task) → wahrscheinlich Infomail
     if (actionAnalysis && actionAnalysis.is_task_for_me === 'No') {
@@ -858,6 +977,7 @@ function shouldGenerateReply_(subject, body, actionAnalysis) {
       ];
       
       if (infoPatterns.some(pattern => combined.includes(pattern))) {
+        Logger.log(`shouldGenerateReply_: Infomail-Pattern erkannt → kein Reply`);
         return false; // Infomail → kein Reply
       }
     }
@@ -874,6 +994,7 @@ function shouldGenerateReply_(subject, body, actionAnalysis) {
     ];
     
     if (noReplyPatterns.some(pattern => combined.includes(pattern))) {
+      Logger.log(`shouldGenerateReply_: Explizite "keine Antwort"-Hinweise → kein Reply`);
       return false; // Explizit keine Antwort erforderlich
     }
     
@@ -881,6 +1002,115 @@ function shouldGenerateReply_(subject, body, actionAnalysis) {
   } catch (e) {
     Logger.log('shouldGenerateReply_ error: ' + e);
     return true; // Bei Fehler: sicherheitshalber Reply generieren
+  }
+}
+
+/**
+ * Generiert eine AI-Response basierend auf dem gesamten Thread-Kontext
+ * @param {string} messageId - Message-ID der aktuellen Mail
+ * @param {number} row - Zeilennummer in der Tabelle (optional, für Kontext)
+ * @return {string} Generierte Response
+ */
+function generateResponseWithThreadContext_(messageId, row) {
+  try {
+    const msg = GmailApp.getMessageById(messageId);
+    if (!msg) {
+      Logger.log('Message nicht gefunden: ' + messageId);
+      return '';
+    }
+
+    const thread = msg.getThread();
+    if (!thread) {
+      Logger.log('Thread nicht gefunden für Message: ' + messageId);
+      return '';
+    }
+
+    // Alle Mails im Thread sammeln (inkl. gesendete Mails!)
+    const messages = thread.getMessages();
+    const myEmails = getMyEmails_();
+    
+    Logger.log(`Thread-Kontext: Analysiere ${messages.length} Mails im Thread (inkl. gesendete Mails)`);
+    
+    // Thread-Kontext aufbauen (chronologisch)
+    const threadContext = [];
+    let latestInbound = null;
+    let myLastReply = null;
+    let inboundCount = 0;
+    let outboundCount = 0;
+    
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const from = (m.getFrom() || '').toLowerCase();
+      const isFromMe = myEmails.some(me => from.includes(me.toLowerCase()));
+      const date = m.getDate();
+      const subject = m.getSubject() || '';
+      const body = getBestBody_(m);
+      const bodyPreview = body.length > 500 ? body.slice(0, 500) + '...' : body;
+      
+      if (!isFromMe) {
+        latestInbound = { date, subject, body: bodyPreview };
+        inboundCount++;
+        threadContext.push({
+          role: 'inbound',
+          date: date ? Utilities.formatDate(date, Session.getScriptTimeZone(), 'dd.MM.yyyy HH:mm') : 'Unbekannt',
+          from: m.getFrom(),
+          subject: subject,
+          body: bodyPreview
+        });
+      } else {
+        myLastReply = { date, subject, body: bodyPreview };
+        outboundCount++;
+        threadContext.push({
+          role: 'outbound',
+          date: date ? Utilities.formatDate(date, Session.getScriptTimeZone(), 'dd.MM.yyyy HH:mm') : 'Unbekannt',
+          from: m.getFrom(),
+          subject: subject,
+          body: bodyPreview
+        });
+      }
+    }
+    
+    Logger.log(`Thread-Kontext: ${inboundCount} eingehende + ${outboundCount} ausgehende (gesendete) Mails gefunden`);
+
+    // Prüfe, ob bereits geantwortet wurde
+    const hasReplied = myLastReply && latestInbound && myLastReply.date > latestInbound.date;
+    const lastReplyISO = myLastReply ? myLastReply.date.toISOString() : '';
+
+    // Thread-Kontext als Text formatieren
+    let contextText = 'E-Mail-Thread-Kontext (chronologisch):\n\n';
+    threadContext.forEach((item, idx) => {
+      contextText += `[${idx + 1}] ${item.role === 'inbound' ? 'EINGEHEND' : 'AUSGEHEND'} - ${item.date}\n`;
+      contextText += `Von: ${item.from}\n`;
+      contextText += `Betreff: ${item.subject}\n`;
+      contextText += `Inhalt:\n${item.body}\n\n`;
+      contextText += '---\n\n';
+    });
+
+    // Aktuelle Mail (die neueste eingehende)
+    const currentSubject = latestInbound ? latestInbound.subject : msg.getSubject();
+    const currentBody = latestInbound ? latestInbound.body : getBestBody_(msg);
+
+    // Prompt für Response-Generierung
+    const base = hasReplied
+      ? `You already replied on ${lastReplyISO}. Draft a short, polite follow-up if no response has been received since then. Keep it under 80 words.`
+      : `Suggest a concise, professional first reply. Keep it under 100 words. Consider the full thread context.`;
+
+    const prompt = `${base}\n\n${contextText}\n\nLatest inbound message to respond to:\nSubject: ${currentSubject}\nBody:\n${currentBody}\n\nWrite the reply in the same language as the latest inbound message.`;
+
+    const payload = {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.5, maxOutputTokens: 1000 }
+    };
+
+    const res = callGeminiAPI_(payload);
+    const data = JSON.parse(res.getContentText() || '{}');
+    const response = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    
+    Logger.log(`Response mit Thread-Kontext generiert: ${threadContext.length} Mails total (${inboundCount} eingehend, ${outboundCount} gesendet)`);
+    return response.trim();
+  } catch (e) {
+    Logger.log('generateResponseWithThreadContext_ error: ' + e);
+    return '';
   }
 }
 

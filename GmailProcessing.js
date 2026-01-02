@@ -218,6 +218,7 @@ function processThreads_(threads) {
         Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
 
       const calendarInvite = isCalendarInvite_(msg);
+      const inviteStatus = calendarInvite ? getCalendarInviteStatus_(msg) : { isConfirmed: false, status: 'none' };
 
       const receivedCH = receivedDate
         ? Utilities.formatDate(receivedDate, CONFIG.TIMEZONE, 'dd.MM.yyyy HH:mm z')
@@ -269,7 +270,12 @@ function processThreads_(threads) {
       };
 
       let action = { is_task_for_me: 'Unsure', reasons: '', suggested_owner: 'unknown', tasks: [] };
-      if (apiTest.valid && !apiTest.quotaExceeded) {
+      
+      // Terminbestätigungen sind keine Tasks (bereits erledigt)
+      if (calendarInvite && inviteStatus.isConfirmed) {
+        action = { is_task_for_me: 'No', reasons: `Termin bereits ${inviteStatus.status === 'accepted' ? 'zugesagt' : inviteStatus.status === 'declined' ? 'abgelehnt' : 'bestätigt'}`, suggested_owner: 'unknown', tasks: [] };
+        Logger.log(`Terminbestätigung erkannt → kein Task nötig`);
+      } else if (apiTest.valid && !apiTest.quotaExceeded) {
         // Prüfe zuerst gelernte Patterns (falls vorhanden)
         const fromDomain = (fromEmail.split('@')[1] || '').toLowerCase();
         const learnedDecision = shouldBeTaskForMe_(fromDomain, subject);
@@ -293,7 +299,12 @@ function processThreads_(threads) {
       }
 
       const taskForMe = action.is_task_for_me || 'Unsure';
-      const notesExtra = action.reasons ? ` | AI-Task: ${action.reasons}` : '';
+      // Due-Date aus AI-Task-Analyse extrahieren (falls vorhanden)
+      let dueDateInfo = '';
+      if (action.tasks && action.tasks.length > 0 && action.tasks[0].due_date) {
+        dueDateInfo = ` | due_date: ${action.tasks[0].due_date}`;
+      }
+      const notesExtra = action.reasons ? ` | AI-Task: ${action.reasons}${dueDateInfo}` : dueDateInfo;
       const notes = `Empfangen: ${receivedCH} | ISO: ${receivedISO}${notesExtra}`;
 
       // Erster KI-Task-Titel (falls vorhanden)
@@ -328,9 +339,32 @@ function processThreads_(threads) {
       let status = isToday ? (CONFIG.STATUS_DEFAULT || 'New') : (CONFIG.STATUS_DEFAULT_OLD || 'Open');
       let totalCost = ''; // Kosten für diese E-Mail
 
+      // Automatisch "Action Required" setzen für Mails, die eine kleine Aktion erfordern,
+      // aber keinen vollständigen Task (z.B. "Unsure" mit kurzer Aktion)
+      // Kalendereinladungen werden bereits auf "Action Required" gesetzt
+      if (!calendarInvite && taskForMe === 'Unsure' && action.reasons) {
+        const reasonsLower = action.reasons.toLowerCase();
+        const quickActionKeywords = ['anschauen', 'prüfen', 'review', 'check', 'kurz', 'quick', 'kurze', 'kleine', 'kurze aktion', 'quick action'];
+        if (quickActionKeywords.some(keyword => reasonsLower.includes(keyword))) {
+          status = 'Action Required';
+          Logger.log(`Automatisch "Action Required" gesetzt für "${subject}" (kleine Aktion erkannt)`);
+        }
+      }
+
       if (calendarInvite) {
-        aiSummary = 'Kalendereinladung erkannt – bitte im Kalender bestaetigen/ablehnen.';
-        status = 'Calendar Invite';
+        if (inviteStatus.isConfirmed) {
+          // Termin wurde bereits bestätigt/abgelehnt → Infomail
+          const statusText = inviteStatus.status === 'accepted' ? 'zugesagt' : 
+                           inviteStatus.status === 'declined' ? 'abgelehnt' : 
+                           inviteStatus.status === 'tentative' ? 'vorläufig zugesagt' : 'bestätigt';
+          aiSummary = `Termineinladung wurde bereits ${statusText}.`;
+          status = 'Replied'; // Als erledigt markieren
+          Logger.log(`Terminbestätigung erkannt: ${statusText}`);
+        } else {
+          // Termin noch nicht bestätigt → Action erforderlich
+          aiSummary = 'Kalendereinladung erkannt – bitte im Kalender bestaetigen/ablehnen.';
+          status = 'Action Required';
+        }
       } else {
         if (apiTest.valid && !apiTest.quotaExceeded) {
           // Kosten-Objekt zurücksetzen
@@ -340,10 +374,17 @@ function processThreads_(threads) {
           const lastReplyISO = replyInfo.myLastReplyDate ? replyInfo.myLastReplyDate.toISOString() : '';
           
           // Prüfe, ob es eine Infomail ist → dann kein Reply-Vorschlag
-          const isInfoMail = shouldGenerateReply_(subject, body, action);
-          if (isInfoMail) {
-            aiReply = ''; // Kein Reply-Vorschlag für Infomails
-            Logger.log(`Reply-Suggestion übersprungen: Infomail erkannt ("${subject}")`);
+          // Terminbestätigungen sind auch Infomails
+          // shouldGenerateReply_() gibt true zurück, wenn Reply generiert werden soll
+          const shouldReply = shouldGenerateReply_(subject, body, action, fromEmail);
+          const isConfirmedInvite = calendarInvite && inviteStatus.isConfirmed;
+          
+          if (!shouldReply || isConfirmedInvite) {
+            aiReply = ''; // Kein Reply-Vorschlag für Infomails oder bestätigte Termine
+            const reason = isConfirmedInvite 
+              ? `Terminbestätigung erkannt ("${subject}")`
+              : `Infomail erkannt ("${subject}")`;
+            Logger.log(`Reply-Suggestion übersprungen: ${reason}`);
           } else {
             aiReply = getAIResponseSuggestionWithLang(
               body,
@@ -418,6 +459,14 @@ function processThreads_(threads) {
       }
       // msg.markRead(); // optional
     }
+  }
+
+  // Automatisch Validierungen/Dropdowns aktualisieren nach Mail-Auslesen
+  try {
+    ensureValidations_();
+    Logger.log('Validierungen/Dropdowns automatisch aktualisiert.');
+  } catch (e) {
+    Logger.log('Fehler beim Aktualisieren der Validierungen: ' + e);
   }
 
   Logger.log('Verarbeitung abgeschlossen.');

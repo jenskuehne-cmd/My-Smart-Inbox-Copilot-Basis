@@ -5,6 +5,7 @@ const CONFIG = {
   SHEET_NAME: 'current activities',
   ARCHIVE_SHEET: 'activity archive',
   PROJECT_MAP_SHEET: 'Project Map',
+  CONFIG_SHEET: 'Configuration', // Stammdaten-Konfiguration
 
   // Standardverhalten
   PROCESS_LIMIT_THREADS: 100,   // taeglich
@@ -96,6 +97,7 @@ const CONFIG = {
   STATUS_OPTIONS: [
     'New',
     'Open',
+    'Action Required',
     'Waiting',
     'Replied',
     'Done (sync)',

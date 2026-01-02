@@ -150,9 +150,52 @@ function onSheetEdit_(e) {
     const sh = e.range.getSheet();
     if (sh.getName() !== CONFIG.SHEET_NAME) return;
 
-    const row = e.range.getRow();
+    const startRow = e.range.getRow();
+    const endRow = e.range.getLastRow();
     const col = e.range.getColumn();
-    if (row <= 1) return;
+    if (startRow <= 1) return;
+
+    // Prüfe, ob es eine Bulk-Änderung ist (mehrere Zeilen)
+    const isBulkEdit = endRow > startRow;
+    
+    // Wenn Bulk-Edit in Spalte C (Status) → verarbeite alle Zeilen
+    if (isBulkEdit && col === 3) {
+      const values = e.range.getValues();
+      const rowsToArchive = [];
+      
+      for (let i = 0; i < values.length; i++) {
+        const row = startRow + i;
+        if (row <= 1) continue; // Header überspringen
+        
+        const newStatus = (values[i][0] || '').toString().trim();
+        if (!newStatus) continue;
+        
+        // WICHTIG: Gmail-Operationen ZUERST ausführen, bevor die Zeile archiviert wird!
+        if (newStatus === 'Done (sync)') {
+          // Label setzen + INBOX entfernen
+          applyGmailLabelFromRow_(sh, row);
+        } else if (newStatus === 'Done (train only)') {
+          // Nur INBOX entfernen (in Papierkorb verschieben), aber kein Label setzen
+          removeFromInboxOnly_(sh, row);
+        }
+        
+        // Archivierung NACH Gmail-Operationen
+        if ((CONFIG.STATUS_ARCHIVE_LIST || []).includes(newStatus)) {
+          rowsToArchive.push(row);
+        }
+      }
+      
+      // Archiviere alle Zeilen (von hinten nach vorne, damit Indizes stimmen)
+      for (let i = rowsToArchive.length - 1; i >= 0; i--) {
+        moveRowToArchive_(rowsToArchive[i]);
+      }
+      
+      Logger.log(`Bulk-Edit: ${values.length} Zeilen verarbeitet, ${rowsToArchive.length} archiviert`);
+      return; // Bulk-Edit abgeschlossen
+    }
+
+    // Einzelne Zeile verarbeiten (wie bisher)
+    const row = startRow;
 
     // 1) Last Updated (K)
     const touchCols = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
@@ -166,25 +209,40 @@ function onSheetEdit_(e) {
       learnFromProjectCorrection_(sh, row);
     }
 
-    // 3) Status-Wechsel (Spalte C)
+    // 3) Status-Wechsel (Spalte C) - einzelne Zeile
     if (col === 3) {
       const newStatus = (e.range.getValue() || '').toString().trim();
 
+      // WICHTIG: Gmail-Operationen ZUERST ausführen, bevor die Zeile archiviert wird!
       if (newStatus === 'Done (sync)') {
+        // Label setzen + INBOX entfernen
         applyGmailLabelFromRow_(sh, row);
+      } else if (newStatus === 'Done (train only)') {
+        // Nur INBOX entfernen (in Papierkorb verschieben), aber kein Label setzen
+        // Learning passiert bereits durch Spalte A-Änderung
+        removeFromInboxOnly_(sh, row);
       }
 
+      // Korrektur aufzeichnen (vor Archivierung)
+      recordCorrection_(sh, row, col, e.oldValue, e.value);
+
+      // Archivierung NACH Gmail-Operationen
       if ((CONFIG.STATUS_ARCHIVE_LIST || []).includes(newStatus)) {
         moveRowToArchive_(row);
         return;
       }
-
-      recordCorrection_(sh, row, col, e.oldValue, e.value);
     }
 
-    // 4) Priority Logging + Google Tasks Sync
+    // 4) Priority Logging + Google Tasks Sync + Learning
     if (col === 4) { // Priority
       recordCorrection_(sh, row, col, e.oldValue, e.value);
+      
+      // Learning: Lerne aus Prioritätsänderungen
+      const newPriority = (e.value || '').toString().trim();
+      if (newPriority && ['Low', 'Medium', 'High', 'Urgent'].includes(newPriority)) {
+        learnFromPriorityCorrection_(sh, row, newPriority);
+      }
+      
       syncGoogleTaskForRow_(sh, row); // Prio-Aenderung kann Auswirkung auf Task haben
     }
 
