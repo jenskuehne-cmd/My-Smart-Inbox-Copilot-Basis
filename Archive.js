@@ -132,6 +132,19 @@ function moveRowToArchive_(rowIndex) {
   const src = ss.getSheetByName(CONFIG.SHEET_NAME);
   if (!src || rowIndex <= 1) return;
 
+  // Prüfe, ob die Zeile wirklich Daten enthält (nicht leer)
+  const firstColValue = src.getRange(rowIndex, 1).getValue();
+  if (!firstColValue || firstColValue.toString().trim() === '') {
+    Logger.log(`moveRowToArchive_: Zeile ${rowIndex} ist leer, überspringe Archivierung`);
+    // Leere Zeile einfach löschen, ohne zu archivieren
+    try {
+      src.deleteRow(rowIndex);
+    } catch (e) {
+      Logger.log('Fehler beim Löschen leerer Zeile: ' + e);
+    }
+    return;
+  }
+
   let dst = ss.getSheetByName(CONFIG.ARCHIVE_SHEET);
   if (!dst) dst = ss.insertSheet(CONFIG.ARCHIVE_SHEET);
 
@@ -140,9 +153,39 @@ function moveRowToArchive_(rowIndex) {
     const header = src.getRange(1, 1, 1, lastCol).getValues();
     dst.getRange(1, 1, 1, lastCol).setValues(header);
   }
+  
+  // Hole alle Werte der Zeile
   const values = src.getRange(rowIndex, 1, 1, lastCol).getValues();
+  
+  // Prüfe, ob die Zeile wirklich Daten enthält (nicht nur leere Zellen)
+  const hasData = values[0].some(cell => cell && cell.toString().trim() !== '');
+  if (!hasData) {
+    Logger.log(`moveRowToArchive_: Zeile ${rowIndex} enthält keine Daten, überspringe Archivierung`);
+    try {
+      src.deleteRow(rowIndex);
+    } catch (e) {
+      Logger.log('Fehler beim Löschen leerer Zeile: ' + e);
+    }
+    return;
+  }
+  
+  // Schreibe in Archiv
   dst.getRange(dst.getLastRow() + 1, 1, 1, lastCol).setValues(values);
-  src.deleteRow(rowIndex);
+  
+  // Lösche Zeile aus Quelle
+  try {
+    src.deleteRow(rowIndex);
+    Logger.log(`moveRowToArchive_: Zeile ${rowIndex} erfolgreich archiviert und gelöscht`);
+  } catch (e) {
+    Logger.log(`moveRowToArchive_: Fehler beim Löschen der Zeile ${rowIndex}: ${e}`);
+    // Versuche es nochmal mit clearContent statt deleteRow
+    try {
+      src.getRange(rowIndex, 1, 1, lastCol).clearContent();
+      Logger.log(`moveRowToArchive_: Zeile ${rowIndex} Inhalt gelöscht (als Fallback)`);
+    } catch (e2) {
+      Logger.log(`moveRowToArchive_: Auch Fallback fehlgeschlagen: ${e2}`);
+    }
+  }
 }
 
 function onSheetEdit_(e) {
@@ -177,6 +220,9 @@ function onSheetEdit_(e) {
         } else if (newStatus === 'Done (train only)') {
           // Nur INBOX entfernen (in Papierkorb verschieben), aber kein Label setzen
           removeFromInboxOnly_(sh, row);
+        } else if (newStatus === 'Action Required') {
+          // Action-Vorschlag generieren (falls noch nicht vorhanden)
+          generateActionSuggestionForRow_(sh, row);
         }
         
         // Archivierung NACH Gmail-Operationen
@@ -221,6 +267,9 @@ function onSheetEdit_(e) {
         // Nur INBOX entfernen (in Papierkorb verschieben), aber kein Label setzen
         // Learning passiert bereits durch Spalte A-Änderung
         removeFromInboxOnly_(sh, row);
+      } else if (newStatus === 'Action Required') {
+        // Action-Vorschlag generieren (falls noch nicht vorhanden)
+        generateActionSuggestionForRow_(sh, row);
       }
 
       // Korrektur aufzeichnen (vor Archivierung)

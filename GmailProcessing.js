@@ -432,6 +432,19 @@ function processThreads_(threads) {
         }
       }
 
+      // Action-Vorschlag für "Action Required" Status (wird später generiert, wenn Status gesetzt wird)
+      let actionSuggestion = '';
+      if (status === 'Action Required') {
+        // Generiere Action-Vorschlag (asynchron, um Performance zu verbessern)
+        // Wird in Spalte F geschrieben, wenn Status auf "Action Required" gesetzt wird
+        if (calendarInvite) {
+          actionSuggestion = 'Kalendereinladung im Kalender prüfen und bestätigen/ablehnen';
+        } else {
+          // Wird später durch generateActionSuggestionForRow_() generiert
+          actionSuggestion = '';
+        }
+      }
+
       // Zeile (A–N) schreiben
       const row = [
         finalLabel,                               // A
@@ -439,7 +452,7 @@ function processThreads_(threads) {
         status,                                   // C
         priority,                                 // D
         aiTaskTitle,                              // E: KI-Task-Vorschlag
-        '',                                       // F (Reserve)
+        actionSuggestion,                         // F: Action-Vorschlag (für "Action Required")
         notes,                                    // G
         aiSummary,                                // H
         taskForMe,                                // I
@@ -452,6 +465,14 @@ function processThreads_(threads) {
 
 
       sheet.appendRow(row);
+      
+      // Wenn Status "Action Required" und noch kein Vorschlag vorhanden, generiere ihn
+      if (status === 'Action Required' && !actionSuggestion) {
+        const newRow = sheet.getLastRow();
+        // Kurze Verzögerung, damit die Zeile geschrieben ist
+        Utilities.sleep(100);
+        generateActionSuggestionForRow_(sheet, newRow);
+      }
       existingIds.add(messageId);
 
       if (processedLabel) {

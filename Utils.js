@@ -1435,5 +1435,142 @@ function shouldBeTaskForMe_(domain, subject) {
 }
 
 
+/**
+ * Generiert einen AI-Vorschlag für die Action, wenn Status auf "Action Required" gesetzt wird
+ * @param {Sheet} sheet - Das Sheet
+ * @param {number} row - Zeilennummer
+ */
+function generateActionSuggestionForRow_(sheet, row) {
+  try {
+    // Prüfe, ob bereits ein Vorschlag vorhanden ist (in Spalte F - Reserve)
+    const existingSuggestion = (sheet.getRange(row, 6).getValue() || '').toString().trim();
+    if (existingSuggestion) {
+      Logger.log(`generateActionSuggestionForRow_: Vorschlag bereits vorhanden für Zeile ${row}`);
+      return; // Bereits vorhanden
+    }
+
+    const subject = (sheet.getRange(row, 2).getValue() || '').toString().trim(); // B
+    const messageId = (sheet.getRange(row, 13).getValue() || '').toString().trim(); // M
+    const summary = (sheet.getRange(row, 8).getValue() || '').toString().trim(); // H: AI Summary
+    
+    if (!messageId) {
+      Logger.log(`generateActionSuggestionForRow_: Keine Message-ID für Zeile ${row}`);
+      return;
+    }
+
+    // Prüfe, ob es eine Kalendereinladung ist
+    let isCalendarInvite = false;
+    try {
+      const msg = GmailApp.getMessageById(messageId);
+      if (msg) {
+        isCalendarInvite = isCalendarInvite_(msg);
+      }
+    } catch (e) {
+      Logger.log('Konnte Message nicht laden: ' + e);
+    }
+
+    // Hole vollständigen Body-Text
+    let bodyText = summary;
+    try {
+      const msg = GmailApp.getMessageById(messageId);
+      if (msg) {
+        bodyText = getBestBody_(msg);
+        // Begrenzt auf 3000 Zeichen für API
+        bodyText = bodyText.length > 3000 ? bodyText.slice(0, 3000) + '...' : bodyText;
+      }
+    } catch (e) {
+      Logger.log('Konnte Message nicht laden, verwende Summary: ' + e);
+      bodyText = summary;
+    }
+
+    // Generiere Action-Vorschlag mit AI
+    let actionSuggestion = '';
+    if (isCalendarInvite) {
+      // Spezieller Prompt für Kalendereinladungen
+      actionSuggestion = generateCalendarInviteActionSuggestion_(subject, bodyText);
+    } else {
+      // Allgemeiner Prompt für andere Mails
+      actionSuggestion = generateGeneralActionSuggestion_(subject, bodyText);
+    }
+
+    // Schreibe Vorschlag in Spalte F (Reserve)
+    if (actionSuggestion && actionSuggestion.trim()) {
+      sheet.getRange(row, 6).setValue(actionSuggestion);
+      Logger.log(`Action-Vorschlag generiert für Zeile ${row}: ${actionSuggestion.substring(0, 50)}...`);
+    }
+  } catch (e) {
+    Logger.log('generateActionSuggestionForRow_ error: ' + e);
+  }
+}
+
+/**
+ * Generiert einen Action-Vorschlag speziell für Kalendereinladungen
+ */
+function generateCalendarInviteActionSuggestion_(subject, body) {
+  try {
+    const prompt = `Du bist ein Assistent, der hilfreiche Action-Vorschläge für Kalendereinladungen gibt.
+
+Die E-Mail enthält eine Kalendereinladung. Gib einen kurzen, präzisen Vorschlag (max. 100 Zeichen), was der Nutzer tun sollte.
+
+Beispiele:
+- "Kalendereinladung im Kalender prüfen und bestätigen/ablehnen"
+- "Termin prüfen: Zeit und Ort kontrollieren, dann im Kalender bestätigen"
+- "Meeting-Einladung ansehen und Teilnahme bestätigen"
+
+E-Mail:
+Betreff: ${subject}
+Inhalt: ${body.substring(0, 1000)}
+
+Gib NUR den Vorschlag zurück, keine Erklärung, keine JSON-Struktur.`;
+
+    const payload = {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 150 }
+    };
+
+    const res = callGeminiAPI_(payload);
+    const data = JSON.parse(res.getContentText() || '{}');
+    return (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+  } catch (e) {
+    Logger.log('generateCalendarInviteActionSuggestion_ error: ' + e);
+    return 'Kalendereinladung im Kalender prüfen und bestätigen/ablehnen';
+  }
+}
+
+/**
+ * Generiert einen Action-Vorschlag für allgemeine Mails
+ */
+function generateGeneralActionSuggestion_(subject, body) {
+  try {
+    const prompt = `Du bist ein Assistent, der hilfreiche Action-Vorschläge für E-Mails gibt.
+
+Die E-Mail erfordert eine kleine Aktion, aber keinen vollständigen Task. Gib einen kurzen, präzisen Vorschlag (max. 100 Zeichen), was der Nutzer tun sollte.
+
+Beispiele:
+- "Person anschauen und Kaffeetermin vereinbaren" (für Coffee Roulette)
+- "Dokument kurz prüfen und Feedback geben"
+- "Anfrage kurz beantworten"
+- "Informationen durchsehen und bestätigen"
+
+E-Mail:
+Betreff: ${subject}
+Inhalt: ${body.substring(0, 1000)}
+
+Gib NUR den Vorschlag zurück, keine Erklärung, keine JSON-Struktur.`;
+
+    const payload = {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 150 }
+    };
+
+    const res = callGeminiAPI_(payload);
+    const data = JSON.parse(res.getContentText() || '{}');
+    return (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+  } catch (e) {
+    Logger.log('generateGeneralActionSuggestion_ error: ' + e);
+    return '';
+  }
+}
+
 syncGoogleTaskForRow_()
 
